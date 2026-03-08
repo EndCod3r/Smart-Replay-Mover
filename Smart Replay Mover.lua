@@ -1,7 +1,7 @@
--- Smart Replay Mover v2.7.8
+-- Smart Replay Mover v2.7.9
 -- Simple, safe, and reliable replay buffer organizer for OBS
 -- ============================================================================
-local VERSION = "2.7.8"
+local VERSION = "2.7.9"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/SlonickLab/Smart-Replay-Mover/main/Smart%20Replay%20Mover.lua"
 local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/releases"
 --
@@ -32,6 +32,13 @@ local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/re
 -- Plagiarism or removal of this notice violates the license terms.
 --
 -- ============================================================================
+-- CHANGELOG v2.7.9:
+--   - Fixed is_ignored() false positives ("obs" no longer matches "observer")
+--   - Converted process ignore check to exact-match hash set (O(1) lookup)
+--   - Added Notification Position option (Top Right/Left, Bottom Right/Left)
+--   - Added "Auto-start Replay Buffer on OBS Launch" option
+--   - Fixed version string mismatches
+--
 -- CHANGELOG v2.7.8:
 --   - Added "Auto-restart Replay Buffer" option (prevents overlapping clips)
 --   - Implemented Event-Driven restart logic (safe & synchronous)
@@ -115,8 +122,11 @@ local CONFIG = {
     enable_thumbnails = false,
     thumbnail_offset = 10.0,
     ffmpeg_path = "",
+    -- Notification position
+    notification_position = "top_right",
     -- Buffer Control
     restart_buffer_after_save = false,
+    auto_start_buffer = false,
 }
 
 -- State tracking for buffer restart
@@ -672,6 +682,9 @@ local GAME_DATABASE = {
     ["fable"] = "Fable: The Lost Chapters",
     ["fable anniversary"] = "Fable Anniversary",
     ["factorio"] = "Factorio",
+    ["factorygame"] = "Satisfactory",
+    ["factorygame-win64-shipping"] = "Satisfactory",
+    ["satisfactory"] = "Satisfactory",
     ["faeria"] = "Faeria",
     ["fairyfencer"] = "Fairy Fencer F",
     ["fallout2"] = "Fallout 2",
@@ -2506,6 +2519,11 @@ local IGNORE_LIST = {
     "processhacker", "procexp", "procexp64",
 }
 
+-- Build hash set for O(1) exact process name matching
+-- (IGNORE_LIST array is kept for window title substring matching in get_game_folder)
+local IGNORE_SET = {}
+for _, v in ipairs(IGNORE_LIST) do IGNORE_SET[v] = true end
+
 
 -- ============================================================================
 -- CUSTOM NAMES (User-defined mappings from GUI)
@@ -3346,6 +3364,35 @@ local function notification_timer_callback()
     end
 end
 
+-- Calculate notification position based on user setting
+local function get_notification_position(scale_factor)
+    local scaled_width = math.floor(NOTIFICATION_WIDTH * scale_factor)
+    local scaled_height = math.floor(NOTIFICATION_HEIGHT * scale_factor)
+    local scaled_margin = math.floor(NOTIFICATION_MARGIN * scale_factor)
+
+    local screen_width = user32.GetSystemMetrics(SM_CXSCREEN)
+    local screen_height = user32.GetSystemMetrics(SM_CYSCREEN)
+
+    local pos = CONFIG.notification_position or "top_right"
+    local x, y
+
+    if pos == "top_left" then
+        x = scaled_margin
+        y = scaled_margin
+    elseif pos == "bottom_right" then
+        x = screen_width - scaled_width - scaled_margin
+        y = screen_height - scaled_height - scaled_margin
+    elseif pos == "bottom_left" then
+        x = scaled_margin
+        y = screen_height - scaled_height - scaled_margin
+    else -- top_right (default)
+        x = screen_width - scaled_width - scaled_margin
+        y = scaled_margin
+    end
+
+    return x, y, scaled_width, scaled_height
+end
+
 -- Show notification popup
 local function show_notification(title, message)
     if not CONFIG.show_notifications then return end
@@ -3388,13 +3435,7 @@ local function show_notification(title, message)
             destroy_orphaned_notifications()
 
             local scale_factor = CONFIG.notification_scale / 100.0
-            local scaled_width = math.floor(NOTIFICATION_WIDTH * scale_factor)
-            local scaled_height = math.floor(NOTIFICATION_HEIGHT * scale_factor)
-            local scaled_margin = math.floor(NOTIFICATION_MARGIN * scale_factor)
-
-            local screen_width = user32.GetSystemMetrics(SM_CXSCREEN)
-            local x = screen_width - scaled_width - scaled_margin
-            local y = scaled_margin
+            local x, y, scaled_width, scaled_height = get_notification_position(scale_factor)
 
             local ex_style = WS_EX_TOPMOST + WS_EX_TOOLWINDOW + WS_EX_NOACTIVATE + WS_EX_LAYERED + WS_EX_TRANSPARENT
 
@@ -3424,12 +3465,7 @@ local function show_notification(title, message)
             
             -- Optional: Position update if resolution changed or scale changed
             local scale_factor = CONFIG.notification_scale / 100.0
-            local scaled_width = math.floor(NOTIFICATION_WIDTH * scale_factor)
-            local scaled_height = math.floor(NOTIFICATION_HEIGHT * scale_factor)
-            local scaled_margin = math.floor(NOTIFICATION_MARGIN * scale_factor)
-            local screen_width = user32.GetSystemMetrics(SM_CXSCREEN)
-            local x = screen_width - scaled_width - scaled_margin
-            local y = scaled_margin
+            local x, y, scaled_width, scaled_height = get_notification_position(scale_factor)
             
             user32.SetWindowPos(notification_hwnd, nil, x, y, scaled_width, scaled_height, 0x0010 + 0x0004) -- SWP_NOACTIVATE + SWP_NOZORDER
         end
@@ -3525,13 +3561,40 @@ local function is_invalid_handle(handle)
     return handle_val == -1 or handle_val == 0
 end
 
-local function clean_name(str)
+local function clean_filename(str)
     if not str or str == "" then return "Unknown" end
     str = string.gsub(str, '[<>:"/\\|?*]', "")
     str = string.gsub(str, "^%s+", "")
     str = string.gsub(str, "%s+$", "")
     if str == "" then return "Unknown" end
     return str
+end
+
+local function clean_folder_path(str)
+    if not str or str == "" then return "Unknown" end
+    -- Allow / and \ for nested folders, but sanitize specific chars
+    str = string.gsub(str, '[<>:"|?*]', "")
+    -- Remove directory traversal attempts
+    str = string.gsub(str, "%.%.", "")
+    -- Normalize slashes
+    str = string.gsub(str, "\\", "/")
+    -- Clean whitespace
+    str = string.gsub(str, "^%s+", "")
+    str = string.gsub(str, "%s+$", "")
+    if str == "" then return "Unknown" end
+    return str
+end
+
+-- Recursive directory creation
+local function recursive_mkdir(path)
+    path = string.gsub(path, "\\", "/")
+    local current = ""
+    for part in string.gmatch(path, "[^/]+") do
+        if current ~= "" then current = current .. "/" end
+        current = current .. part
+        obs.os_mkdir(current)
+    end
+    return obs.os_file_exists(path)
 end
 
 -- Truncate filename to fit within MAX_PATH limit
@@ -3566,12 +3629,9 @@ end
 local function is_ignored(name)
     if not name or name == "" then return true end
     local lower = string.lower(name)
-    for _, ignored in ipairs(IGNORE_LIST) do
-        if string.find(lower, ignored, 1, true) then
-            return true
-        end
-    end
-    return false
+    -- Exact match via hash set (O(1)) — no false positives
+    -- e.g. "obs" won't match "observer", "code" won't match "barcode"
+    return IGNORE_SET[lower] == true
 end
 
 -- ============================================================================
@@ -3621,7 +3681,7 @@ local function get_game_folder(raw_name, window_title, skip_window_fallback)
         end
 
         -- Use raw name if no pattern match (clean it for folder name)
-        return clean_name(raw_name)
+        return clean_filename(raw_name)
     end
 
     -- If skip_window_fallback is true, process was ignored (Explorer, Discord, etc.)
@@ -3954,7 +4014,7 @@ local function safe_mkdir(path)
         return true
     end
 
-    obs.os_mkdir(path)
+    recursive_mkdir(path)
 
     return obs.os_file_exists(path)
 end
@@ -4176,8 +4236,15 @@ local function move_file(src, folder_name, game_name)
             dbg("File is very small (" .. file_size .. " bytes), might be incomplete")
         end
 
-        local safe_folder = clean_name(folder_name)
-        local real_folder = get_existing_folder(dir, safe_folder)
+        local safe_folder = clean_folder_path(folder_name)
+        local real_folder = safe_folder
+        
+        -- If safe_folder contains separators (nested folder), skip fuzzy existing check
+        -- Otherwise (simple folder), try to find existing folder with matching case (e.g. "game" -> "Game")
+        if not string.find(safe_folder, "[/\\]") then
+            real_folder = get_existing_folder(dir, safe_folder)
+        end
+        
         local target_dir = dir .. "/" .. real_folder
 
         if CONFIG.use_date_subfolders then
@@ -4193,7 +4260,13 @@ local function move_file(src, folder_name, game_name)
               ", will_add=" .. tostring(should_add_prefix))
 
         if should_add_prefix then
-            local safe_game = clean_name(game_name)
+            -- For nested paths (e.g., "Singleplayer/DS3"), use only the last segment as prefix
+            local prefix_source = game_name
+            if string.find(game_name, "[/\\]") then
+                prefix_source = string.match(game_name, "([^/\\]+)$") or game_name
+                dbg("Nested path detected, using last segment for prefix: " .. prefix_source)
+            end
+            local safe_game = clean_filename(prefix_source)
             new_filename = safe_game .. " - " .. filename
             dbg("Added prefix: " .. new_filename)
         end
@@ -4468,6 +4541,19 @@ local function start_buffer_delayed()
     obs.obs_frontend_replay_buffer_start()
     dbg("Replay Buffer auto-restarted")
 end 
+
+-- Auto-start replay buffer on OBS launch (5s delay for full initialization)
+local function auto_start_buffer_on_load()
+    obs.timer_remove(auto_start_buffer_on_load)
+    local ok, err = pcall(function()
+        obs.obs_frontend_replay_buffer_start()
+        log("Auto-started Replay Buffer on launch")
+        notify("Replay Buffer", "Auto-started on launch")
+    end)
+    if not ok then
+        dbg("Auto-start buffer failed: " .. tostring(err))
+    end
+end
 
 -- ============================================================================
 -- FRONTEND EVENT HANDLER
@@ -4908,6 +4994,8 @@ local function read_config(settings)
     CONFIG.thumbnail_offset = obs.obs_data_get_double(settings, "thumbnail_offset")
     CONFIG.ffmpeg_path = obs.obs_data_get_string(settings, "ffmpeg_path")
     CONFIG.restart_buffer_after_save = obs.obs_data_get_bool(settings, "restart_buffer_after_save")
+    CONFIG.auto_start_buffer = obs.obs_data_get_bool(settings, "auto_start_buffer")
+    CONFIG.notification_position = obs.obs_data_get_string(settings, "notification_position")
 
     if CONFIG.fallback_folder == "" then
         CONFIG.fallback_folder = "Desktop"
@@ -5148,6 +5236,7 @@ function script_properties()
     -- BUFFER CONTROL GROUP
     local buffer_group = obs.obs_properties_create()
     obs.obs_properties_add_bool(buffer_group, "restart_buffer_after_save", "🔄  Auto-restart Replay Buffer after save (Prevent Overlap)")
+    obs.obs_properties_add_bool(buffer_group, "auto_start_buffer", "▶️  Auto-start Replay Buffer on OBS launch")
     obs.obs_properties_add_group(props, "buffer_section", "🔄  BUFFER CONTROL", obs.OBS_GROUP_NORMAL, buffer_group)
 
     -- ORGANIZATION GROUP
@@ -5170,6 +5259,12 @@ function script_properties()
     obs.obs_properties_add_bool(notify_group, "play_sound", "🔊  Play notification sound (works in Fullscreen too)")
     
     local p_scale = obs.obs_properties_add_float_slider(notify_group, "notification_scale", "📏  Scale %", 100.0, 300.0, 10.0)
+    
+    local p_pos = obs.obs_properties_add_list(notify_group, "notification_position", "📍  Position", obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    obs.obs_property_list_add_string(p_pos, "↗ Top Right", "top_right")
+    obs.obs_property_list_add_string(p_pos, "↖ Top Left", "top_left")
+    obs.obs_property_list_add_string(p_pos, "↘ Bottom Right", "bottom_right")
+    obs.obs_property_list_add_string(p_pos, "↙ Bottom Left", "bottom_left")
     
     obs.obs_properties_add_bool(notify_group, "use_quiet_sound", "🔇  Use Quiet Sound (notification_sound_silent.wav)")
 
@@ -5213,6 +5308,8 @@ function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "thumbnail_offset", 10.0)
     obs.obs_data_set_default_string(settings, "ffmpeg_path", "")
     obs.obs_data_set_default_bool(settings, "restart_buffer_after_save", false)
+    obs.obs_data_set_default_bool(settings, "auto_start_buffer", false)
+    obs.obs_data_set_default_string(settings, "notification_position", "top_right")
 end
 
 function script_update(settings)
@@ -5249,7 +5346,7 @@ function script_load(settings)
         for _ in pairs(GAME_DATABASE) do db_count = db_count + 1 end
     end
 
-    log("Smart Replay Mover v2.7.8 loaded (GPL v3 - github.com/SlonickLab/Smart-Replay-Mover)")
+    log("Smart Replay Mover v" .. VERSION .. " loaded (GPL v3 - github.com/SlonickLab/Smart-Replay-Mover)")
     log("Database: " .. db_count .. " games | Custom: " .. custom_count .. " mappings")
     log("Prefix: " .. (CONFIG.add_game_prefix and "ON" or "OFF") ..
         " | Recordings: " .. (CONFIG.organize_recordings and "ON" or "OFF") ..
@@ -5275,6 +5372,12 @@ function script_load(settings)
         startup_update_status = "⚠️ Check unavailable"
         startup_update_check_done = true
     end
+
+    -- AUTO-START REPLAY BUFFER (5s delay for OBS to fully initialize)
+    if CONFIG.auto_start_buffer then
+        obs.timer_add(auto_start_buffer_on_load, 5000)
+        dbg("Auto-start buffer scheduled in 5s")
+    end
 end
 
 function script_unload()
@@ -5282,6 +5385,7 @@ function script_unload()
     obs.timer_remove(notification_timer_callback)
     obs.timer_remove(delayed_recording_init)
     obs.timer_remove(parse_startup_update_result)  -- Stop startup update check if still running
+    obs.timer_remove(auto_start_buffer_on_load)    -- Cancel auto-start if still pending
     notification_timer_should_stop = true
 
     disconnect_recording_signals()
@@ -5301,7 +5405,7 @@ function script_unload()
 end
 
 -- ============================================================================
--- END OF SCRIPT v2.7.8
+-- END OF SCRIPT v2.7.9
 -- Copyright (C) 2025-2026 SlonickLab - Licensed under GPL v3
 -- https://github.com/SlonickLab/Smart-Replay-Mover
 -- ============================================================================

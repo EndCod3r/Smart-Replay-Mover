@@ -1,7 +1,7 @@
--- Smart Replay Mover v2.7.9
+-- Smart Replay Mover v2.8.0
 -- Simple, safe, and reliable replay buffer organizer for OBS
 -- ============================================================================
-local VERSION = "2.7.9"
+local VERSION = "2.8.0"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/SlonickLab/Smart-Replay-Mover/main/Smart%20Replay%20Mover.lua"
 local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/releases"
 --
@@ -32,6 +32,11 @@ local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/re
 -- Plagiarism or removal of this notice violates the license terms.
 --
 -- ============================================================================
+-- CHANGELOG v2.8.0:
+--   - Added "No Folder" mode: map process to "." to keep files in OBS output root
+--   - Added Smart Save Hotkey with instant "Saving..." notification feedback
+--   - Cleaned up duplicate ffi.cdef type declarations (code quality)
+--
 -- CHANGELOG v2.7.9:
 --   - Fixed is_ignored() false positives ("obs" no longer matches "observer")
 --   - Converted process ignore check to exact-match hash set (O(1) lookup)
@@ -4040,12 +4045,9 @@ end
 -- FFMPEG SUPPORT (FFI / Sync ShellExecuteEx Method)
 -- ============================================================================
 
+-- NOTE: HANDLE, HWND, HINSTANCE, DWORD, BOOL, UINT are already declared in the
+-- WINDOWS API section above. Only new struct/function declarations go here.
 ffi.cdef[[
-    typedef void* HANDLE;
-    typedef void* HWND;
-    typedef void* HINSTANCE;
-    typedef unsigned long DWORD;
-    
     typedef struct {
         DWORD cbSize;
         DWORD fMask;
@@ -4069,8 +4071,6 @@ ffi.cdef[[
 
     int ShellExecuteExA(SHELLEXECUTEINFOA* pExecInfo);
     DWORD WaitForSingleObject(HANDLE hHandle, DWORD dwMilliseconds);
-    int CloseHandle(HANDLE hObject);
-    BOOL TerminateProcess(HANDLE hProcess, UINT uExitCode);
 ]]
 
 local shell32 = ffi.load("shell32")
@@ -4234,6 +4234,36 @@ local function move_file(src, folder_name, game_name)
             log("WARNING: Source file appears empty or inaccessible: " .. src)
         elseif file_size < 1024 then
             dbg("File is very small (" .. file_size .. " bytes), might be incomplete")
+        end
+
+        -- ═══════════════════════════════════════════════════════════════
+        -- "NO FOLDER" MODE: folder_name == ".", "/", or "\" means keep in OBS root
+        -- File stays in the same directory, only prefix is added (if enabled)
+        -- ═══════════════════════════════════════════════════════════════
+        if folder_name == "." or folder_name == "/" or folder_name == "\\" then
+            dbg("No-folder mode active, keeping file in output root")
+            local new_filename = filename
+            -- Still add prefix if enabled and game_name is meaningful
+            local should_add_prefix = CONFIG.add_game_prefix and game_name and game_name ~= "" and (game_name ~= "." and game_name ~= "/" and game_name ~= "\\") and game_name ~= CONFIG.fallback_folder
+            if should_add_prefix then
+                local safe_game = clean_filename(game_name)
+                new_filename = safe_game .. " - " .. filename
+                dbg("No-folder mode: added prefix -> " .. new_filename)
+            end
+            local target_path = dir .. "/" .. new_filename
+            -- If filename didn't change, nothing to do
+            if target_path == src then
+                log("No-folder mode: file already in place (no prefix): " .. filename)
+                files_moved = files_moved + 1
+                return true
+            end
+            if obs.os_rename(src, target_path) then
+                log("Renamed (no-folder mode): " .. new_filename)
+                files_moved = files_moved + 1
+                return true
+            end
+            log("ERROR: Failed to rename file in no-folder mode")
+            return false
         end
 
         local safe_folder = clean_folder_path(folder_name)
@@ -5219,7 +5249,7 @@ function script_properties()
 
     -- CUSTOM NAMES GROUP
     local custom_group = obs.obs_properties_create()
-    obs.obs_properties_add_text(custom_group, "custom_names_help", "Custom names have HIGHEST priority! Format: game > Folder | +keywords > Folder | *text* > Folder", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(custom_group, "custom_names_help", "Custom names have HIGHEST priority! Format: game > Folder | +keywords > Folder | *text* > Folder | game > / or . (no folder)", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_text(custom_group, "new_process_name", "🎯  Game (process, +keywords, or *text*)", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_text(custom_group, "new_folder_name", "📁  Folder name", obs.OBS_TEXT_DEFAULT)
     obs.obs_properties_add_button(custom_group, "add_mapping_btn", "➕  Add", add_custom_mapping)
@@ -5237,6 +5267,7 @@ function script_properties()
     local buffer_group = obs.obs_properties_create()
     obs.obs_properties_add_bool(buffer_group, "restart_buffer_after_save", "🔄  Auto-restart Replay Buffer after save (Prevent Overlap)")
     obs.obs_properties_add_bool(buffer_group, "auto_start_buffer", "▶️  Auto-start Replay Buffer on OBS launch")
+    obs.obs_properties_add_text(buffer_group, "smart_save_help", "💡 Smart Save: Go to OBS Settings → Hotkeys → find 'Smart Save Replay' and assign your key. Shows instant 'Saving...' feedback!", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_group(props, "buffer_section", "🔄  BUFFER CONTROL", obs.OBS_GROUP_NORMAL, buffer_group)
 
     -- ORGANIZATION GROUP
@@ -5327,6 +5358,27 @@ function script_update(settings)
     end
 end
 
+-- Smart Save Hotkey state
+local smart_save_hotkey_id = nil
+
+-- Smart Save Hotkey callback: shows instant "Saving..." then triggers save
+local function smart_save_replay(pressed)
+    if not pressed then return end
+    
+    local ok, err = pcall(function()
+        -- Show instant feedback
+        notify("Saving...", "Replay buffer saving...")
+        dbg("Smart Save: hotkey pressed, showing instant notification")
+        
+        -- Trigger the actual save
+        obs.obs_frontend_replay_buffer_save()
+    end)
+    
+    if not ok then
+        log("ERROR in Smart Save hotkey: " .. tostring(err))
+    end
+end
+
 function script_load(settings)
     destroy_orphaned_notifications()
 
@@ -5335,6 +5387,21 @@ function script_load(settings)
     load_custom_names(settings)
 
     obs.obs_frontend_add_event_callback(on_event)
+
+    -- Register Smart Save Replay hotkey
+    smart_save_hotkey_id = obs.obs_hotkey_register_frontend(
+        "smart_save_replay",
+        "Smart Save Replay (Instant Notification)",
+        smart_save_replay
+    )
+    
+    -- Load saved hotkey binding
+    local hotkey_save_array = obs.obs_data_get_array(settings, "smart_save_replay_hotkey")
+    if hotkey_save_array then
+        obs.obs_hotkey_load(smart_save_hotkey_id, hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+    dbg("Smart Save Replay hotkey registered")
 
     local exact_count = 0
     for _ in pairs(CUSTOM_NAMES_EXACT) do exact_count = exact_count + 1 end
@@ -5380,6 +5447,15 @@ function script_load(settings)
     end
 end
 
+-- Save hotkey binding when settings are saved
+function script_save(settings)
+    if smart_save_hotkey_id then
+        local hotkey_save_array = obs.obs_hotkey_save(smart_save_hotkey_id)
+        obs.obs_data_set_array(settings, "smart_save_replay_hotkey", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+end
+
 function script_unload()
     obs.timer_remove(check_split_files)
     obs.timer_remove(notification_timer_callback)
@@ -5405,7 +5481,7 @@ function script_unload()
 end
 
 -- ============================================================================
--- END OF SCRIPT v2.7.9
+-- END OF SCRIPT v2.8.0
 -- Copyright (C) 2025-2026 SlonickLab - Licensed under GPL v3
 -- https://github.com/SlonickLab/Smart-Replay-Mover
 -- ============================================================================

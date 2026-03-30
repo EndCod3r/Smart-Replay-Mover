@@ -6,7 +6,7 @@
 
   **Automatically organize your Replay Buffer clips, Recordings, and Screenshots into game-specific folders.**
 
-  [![Version](https://img.shields.io/badge/version-2.8.0-00d4aa.svg)](https://github.com/SlonickLab/Smart-Replay-Mover/releases)
+  [![Version](https://img.shields.io/badge/version-2.8.1-00d4aa.svg)](https://github.com/SlonickLab/Smart-Replay-Mover/releases)
   [![License](https://img.shields.io/badge/license-GPL%20v3-blue.svg)](LICENSE)
   [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6.svg)]()
   [![OBS](https://img.shields.io/badge/OBS-28.x+-302E31.svg)](https://obsproject.com/)
@@ -296,6 +296,12 @@
 
   ## 📋 Changelog
   
+  ### v2.8.1 (Hotfix)
+  - **🛡️ CRITICAL FIX** — Smart Save Hotkey no longer crashes or freezes OBS ([Discussion #16](https://github.com/SlonickLab/Smart-Replay-Mover/discussions/16))
+  - **🧵 Thread-Safe Notifications** — All notification calls now go through a safe queue processed exclusively on one thread, eliminating cross-thread Win32 GDI deadlocks
+  - **⚡ Smart Skip** — On fast systems (NVMe/SSD), the intermediate "Saving..." is automatically skipped in favor of "Clip Saved" when save completes instantly
+  - **🐛 Detection Fix** — Fixed double `detect_game()` call during replay buffer save that could cause wrong folder assignment
+
   ### v2.8.0
   - **⚡ Smart Save Hotkey** — New OBS hotkey "Smart Save Replay" shows instant "Saving..." notification before the file is written, then the usual "Clip Saved" when done (Idea by rambam1120, [Issue #14](https://github.com/SlonickLab/Smart-Replay-Mover/issues/14))
   - **📂 No-Folder Mode** — Map a process to `/`, `\`, or `.` to keep files in OBS output root without creating a subfolder (Idea by lemenegg)

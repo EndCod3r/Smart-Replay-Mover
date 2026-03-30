@@ -1,7 +1,7 @@
--- Smart Replay Mover v2.8.0
+-- Smart Replay Mover v2.8.1
 -- Simple, safe, and reliable replay buffer organizer for OBS
 -- ============================================================================
-local VERSION = "2.8.0"
+local VERSION = "2.8.1"
 local GITHUB_RAW_URL = "https://raw.githubusercontent.com/SlonickLab/Smart-Replay-Mover/main/Smart%20Replay%20Mover.lua"
 local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/releases"
 --
@@ -32,6 +32,14 @@ local GITHUB_RELEASES_URL = "https://github.com/SlonickLab/Smart-Replay-Mover/re
 -- Plagiarism or removal of this notice violates the license terms.
 --
 -- ============================================================================
+-- CHANGELOG v2.8.1 (HOTFIX):
+--   - CRITICAL FIX: Smart Save Hotkey no longer crashes/freezes OBS
+--   - Root cause: cross-thread Win32 GDI calls from hotkey/UI/graphics threads
+--   - Solution: thread-safe notification queue (notify() pushes to queue,
+--     single graphics-thread timer processes all Win32/GDI operations)
+--   - Fixed double detect_game() call in replay buffer save handler
+--   - Smart skip: if save is fast, "Saving..." is skipped in favor of "Clip Saved"
+--
 -- CHANGELOG v2.8.0:
 --   - Added "No Folder" mode: map process to "." to keep files in OBS output root
 --   - Added Smart Save Hotkey with instant "Saving..." notification feedback
@@ -3517,10 +3525,46 @@ local function play_notification_sound()
     end)
 end
 
--- Combined notification function
+-- ============================================================================
+-- THREAD-SAFE NOTIFICATION QUEUE
+-- ============================================================================
+-- PROBLEM: notify() is called from multiple threads:
+--   - Hotkey callbacks  → OBS hotkey thread
+--   - on_event()        → OBS UI/main thread
+--   - Timer callbacks   → OBS graphics thread
+-- Win32 windows MUST be created and manipulated from the SAME thread.
+-- Cross-thread Win32 operations cause undefined behavior (hangs/deadlocks).
+--
+-- SOLUTION: notify() just pushes a message into a Lua table (queue).
+-- process_notification_queue() is the ONLY function that calls show_notification()
+-- and play_notification_sound(). It runs exclusively on the graphics thread via
+-- a dedicated obs.timer_add, ensuring all GDI/Win32 calls are on one thread.
+-- ============================================================================
+
+local notification_queue = {}
+
+-- Thread-safe: safe to call from hotkey thread, UI thread, or graphics thread.
+-- Does NO Win32/GDI work — only inserts into a Lua table.
 local function notify(title, message)
+    table.insert(notification_queue, { title = title, message = message })
+end
+
+-- Runs on the graphics thread every 50ms via obs.timer_add in script_load.
+-- This is the SOLE consumer of notification_queue.
+local function process_notification_queue()
+    if #notification_queue == 0 then return end
+
+    local notif = table.remove(notification_queue, 1)
+
+    -- Optimization for fast systems (NVMe/SSD):
+    -- If "Saving..." is immediately followed by another notification (e.g. "Clip Saved"),
+    -- skip the intermediate "Saving..." and show the final result right away.
+    if notif.title == "Saving..." and #notification_queue > 0 then
+        notif = table.remove(notification_queue, 1)
+    end
+
     play_notification_sound()
-    show_notification(title, message)
+    show_notification(notif.title, notif.message)
 end
 
 -- Cleanup notification resources
@@ -4613,7 +4657,9 @@ local function on_event(event)
                 local raw_game, window_title, skip_fallback = detect_game()
                 local folder_name = get_game_folder(raw_game, window_title, skip_fallback)
 
-                process_file(path)
+                -- Use process_file_with_game to avoid calling detect_game() a second time
+                -- inside process_file() which would cause a race if the active window changed
+                process_file_with_game(path, folder_name, raw_game)
 
                 notify("Clip Saved", "Moved to: " .. folder_name)
                 
@@ -5361,19 +5407,22 @@ end
 -- Smart Save Hotkey state
 local smart_save_hotkey_id = nil
 
--- Smart Save Hotkey callback: shows instant "Saving..." then triggers save
+-- Smart Save Hotkey callback.
+-- notify() is now thread-safe (pushes to queue only, no Win32 calls).
+-- obs_frontend_replay_buffer_save() is thread-safe (uses OBS signal handler internally).
+-- Both can be called directly from the hotkey thread -- no timer deferral needed.
 local function smart_save_replay(pressed)
     if not pressed then return end
-    
+
     local ok, err = pcall(function()
-        -- Show instant feedback
+        -- Queue "Saving..." -- displayed by process_notification_queue on the graphics thread.
+        -- On fast systems (NVMe), save completes before the 50ms timer fires, so the
+        -- optimization in process_notification_queue skips it and shows "Clip Saved" directly.
         notify("Saving...", "Replay buffer saving...")
-        dbg("Smart Save: hotkey pressed, showing instant notification")
-        
-        -- Trigger the actual save
+        dbg("Smart Save: queued instant notification, triggering save")
         obs.obs_frontend_replay_buffer_save()
     end)
-    
+
     if not ok then
         log("ERROR in Smart Save hotkey: " .. tostring(err))
     end
@@ -5387,6 +5436,11 @@ function script_load(settings)
     load_custom_names(settings)
 
     obs.obs_frontend_add_event_callback(on_event)
+
+    -- Start the notification queue processor on the graphics thread.
+    -- This is the ONLY place that calls show_notification() / play_notification_sound().
+    -- All notify() calls from any thread are safe because they only push to the queue.
+    obs.timer_add(process_notification_queue, 50)
 
     -- Register Smart Save Replay hotkey
     smart_save_hotkey_id = obs.obs_hotkey_register_frontend(
@@ -5459,10 +5513,12 @@ end
 function script_unload()
     obs.timer_remove(check_split_files)
     obs.timer_remove(notification_timer_callback)
+    obs.timer_remove(process_notification_queue)   -- Stop notification queue processor
     obs.timer_remove(delayed_recording_init)
     obs.timer_remove(parse_startup_update_result)  -- Stop startup update check if still running
     obs.timer_remove(auto_start_buffer_on_load)    -- Cancel auto-start if still pending
     notification_timer_should_stop = true
+    notification_queue = {}                        -- Discard any pending notifications
 
     disconnect_recording_signals()
 
@@ -5481,7 +5537,7 @@ function script_unload()
 end
 
 -- ============================================================================
--- END OF SCRIPT v2.8.0
+-- END OF SCRIPT v2.8.1
 -- Copyright (C) 2025-2026 SlonickLab - Licensed under GPL v3
 -- https://github.com/SlonickLab/Smart-Replay-Mover
 -- ============================================================================

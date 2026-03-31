@@ -140,6 +140,8 @@ local CONFIG = {
     -- Buffer Control
     restart_buffer_after_save = false,
     auto_start_buffer = false,
+    -- Process scan detection
+    scan_all_processes = false,
 }
 
 -- State tracking for buffer restart
@@ -2806,6 +2808,7 @@ ffi.cdef[[
     HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
     BOOL CloseHandle(HANDLE hObject);
     DWORD GetModuleBaseNameA(HANDLE hProcess, void* hModule, char* lpBaseName, DWORD nSize);
+    BOOL EnumProcesses(DWORD* lpidProcess, DWORD cb, DWORD* lpcbNeeded);
     int GetWindowTextA(HWND hWnd, char* lpString, int nMaxCount);
     int GetWindowTextW(HWND hWnd, wchar_t* lpString, int nMaxCount);
     BOOL QueryFullProcessImageNameA(HANDLE hProcess, DWORD dwFlags, char* lpExeName, DWORD* lpdwSize);
@@ -3976,25 +3979,102 @@ local function find_game_in_obs()
     return ok and result or nil
 end
 
+local TH32CS_SNAPPROCESS = 0x00000002
+
+local function get_running_game()
+    local ok, result = pcall(function()
+        local MAX_PIDS = 1024
+        local pids = ffi.new("DWORD[?]", MAX_PIDS)
+        local bytes_returned = ffi.new("DWORD[1]", 0)
+
+        local enum_ok = psapi.EnumProcesses(pids, MAX_PIDS * ffi.sizeof("DWORD"), bytes_returned)
+        if enum_ok == 0 then
+            dbg("get_running_game: EnumProcesses failed")
+            return nil
+        end
+
+        local count = math.floor(bytes_returned[0] / ffi.sizeof("DWORD"))
+        dbg("get_running_game: scanning " .. count .. " processes")
+
+        local buffer = ffi.new("char[260]")
+
+        for i = 0, count - 1 do
+            local pid = pids[i]
+            if pid ~= 0 then
+                local name = nil
+
+                -- Try full access + GetModuleBaseNameA first
+                local proc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION + PROCESS_VM_READ, 0, pid)
+                if not is_invalid_handle(proc) then
+                    local get_ok, len = pcall(function()
+                        return psapi.GetModuleBaseNameA(proc, nil, buffer, 260)
+                    end)
+                    kernel32.CloseHandle(proc)
+                    if get_ok and len and len > 0 then
+                        name = ffi.string(buffer, len)
+                    end
+                end
+
+                -- Fall back to QueryFullProcessImageNameA (works for anti-cheat like BattlEye/Siege)
+                if not name then
+                    local proc2 = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+                    if not is_invalid_handle(proc2) then
+                        local size = ffi.new("DWORD[1]", 260)
+                        local qok, qres = pcall(function()
+                            local res = kernel32.QueryFullProcessImageNameA(proc2, 0, buffer, size)
+                            if res ~= 0 and size[0] > 0 then
+                                local full = ffi.string(buffer, size[0])
+                                return string.match(full, "([^/\\]+)$") or full
+                            end
+                            return nil
+                        end)
+                        kernel32.CloseHandle(proc2)
+                        if qok and qres then name = qres end
+                    end
+                end
+
+                if name then
+                    name = string.gsub(name, "%.[eE][xX][eE]$", ""):lower()
+                    if not is_ignored(name) and GAME_DATABASE[name] then
+                        dbg("Running game found via process scan: " .. name)
+                        return name
+                    end
+                end
+            end
+        end
+
+        return nil
+    end)
+    if not ok then
+        dbg("get_running_game ERROR: " .. tostring(result))
+        return nil
+    end
+    return result
+end
+
 -- Detect active game
 -- Returns: process_or_game_name, window_title, skip_window_fallback
 local function detect_game()
-    local process = get_active_process()
     local title = get_window_title()
     local window_title_for_matching = title
 
-    -- 1. If process is in ignore list - DON'T use window title fallback
-    if process and is_ignored(process) then
-        dbg("Process ignored, using fallback: " .. process)
-        return nil, window_title_for_matching, true
+    -- 1. Scan all running processes for a known game (works regardless of focus)
+    if CONFIG.scan_all_processes then
+        local running = get_running_game()
+        if running then
+            dbg("Detected from running process scan: " .. running)
+            return running, window_title_for_matching, false
+        end
     end
 
-    -- 2. Try active window process
+    -- 2. Fall back to focused window process (catches unlisted games)
+    local process = get_active_process()
+    if process and is_ignored(process) then
+        dbg("Focused process ignored, using fallback: " .. process)
+        return nil, window_title_for_matching, true
+    end
     if process then
-        dbg("Detected from active process: " .. process)
-        if title then
-            dbg("Window title available: " .. title)
-        end
+        dbg("Detected from focused process (not in DB): " .. process)
         return process, window_title_for_matching, false
     end
 
@@ -5071,6 +5151,7 @@ local function read_config(settings)
     CONFIG.ffmpeg_path = obs.obs_data_get_string(settings, "ffmpeg_path")
     CONFIG.restart_buffer_after_save = obs.obs_data_get_bool(settings, "restart_buffer_after_save")
     CONFIG.auto_start_buffer = obs.obs_data_get_bool(settings, "auto_start_buffer")
+    CONFIG.scan_all_processes = obs.obs_data_get_bool(settings, "scan_all_processes")
     CONFIG.notification_position = obs.obs_data_get_string(settings, "notification_position")
 
     if CONFIG.fallback_folder == "" then
@@ -5321,6 +5402,8 @@ function script_properties()
     obs.obs_properties_add_bool(folder_group, "use_date_subfolders", "📅  Create monthly subfolders (YYYY-MM)")
     obs.obs_properties_add_bool(folder_group, "organize_screenshots", "📸  Also organize screenshots")
     obs.obs_properties_add_bool(folder_group, "organize_recordings", "🎬  Organize recordings (Start/Stop Recording)")
+    obs.obs_properties_add_bool(folder_group, "scan_all_processes", "🔍  Detect game by scanning all running processes")
+    obs.obs_properties_add_text(folder_group, "scan_all_processes_help", "Detects games even when the game window is not focused. Disable to revert to focus-based detection.", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_group(props, "folder_section", "🗂️  ORGANIZATION", obs.OBS_GROUP_NORMAL, folder_group)
 
     -- SPAM PROTECTION GROUP
@@ -5386,6 +5469,7 @@ function script_defaults(settings)
     obs.obs_data_set_default_string(settings, "ffmpeg_path", "")
     obs.obs_data_set_default_bool(settings, "restart_buffer_after_save", false)
     obs.obs_data_set_default_bool(settings, "auto_start_buffer", false)
+    obs.obs_data_set_default_bool(settings, "scan_all_processes", false)
     obs.obs_data_set_default_string(settings, "notification_position", "top_right")
 end
 

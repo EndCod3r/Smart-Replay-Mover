@@ -2808,7 +2808,6 @@ ffi.cdef[[
     HANDLE OpenProcess(DWORD dwDesiredAccess, BOOL bInheritHandle, DWORD dwProcessId);
     BOOL CloseHandle(HANDLE hObject);
     DWORD GetModuleBaseNameA(HANDLE hProcess, void* hModule, char* lpBaseName, DWORD nSize);
-    BOOL EnumProcesses(DWORD* lpidProcess, DWORD cb, DWORD* lpcbNeeded);
     int GetWindowTextA(HWND hWnd, char* lpString, int nMaxCount);
     int GetWindowTextW(HWND hWnd, wchar_t* lpString, int nMaxCount);
     BOOL QueryFullProcessImageNameA(HANDLE hProcess, DWORD dwFlags, char* lpExeName, DWORD* lpdwSize);
@@ -2817,6 +2816,24 @@ ffi.cdef[[
     int WideCharToMultiByte(unsigned int CodePage, DWORD dwFlags, const wchar_t* lpWideCharStr, int cchWideChar, char* lpMultiByteStr, int cbMultiByte, const char* lpDefaultChar, int* lpUsedDefaultChar);
     BOOL DeleteFileW(LPCWSTR lpFileName);
     BOOL IsWindow(HWND hWnd);
+
+    // Toolhelp32 Snapshot
+    typedef struct tagPROCESSENTRY32 {
+        DWORD dwSize;
+        DWORD cntUsage;
+        DWORD th32ProcessID;
+        UINT_PTR th32DefaultHeapID;
+        DWORD th32ModuleID;
+        DWORD cntThreads;
+        DWORD th32ParentProcessID;
+        LONG  pcPriClassBase;
+        DWORD dwFlags;
+        char szExeFile[260];
+    } PROCESSENTRY32;
+
+    HANDLE CreateToolhelp32Snapshot(DWORD dwFlags, DWORD th32ProcessID);
+    BOOL Process32First(HANDLE hSnapshot, void* lppe);
+    BOOL Process32Next(HANDLE hSnapshot, void* lppe);
 
     typedef struct {
         DWORD dwFileAttributes;
@@ -2932,6 +2949,7 @@ pcall(function() shell32 = ffi.load("shell32") end)
 local PROCESS_QUERY_INFORMATION = 0x0400
 local PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 local PROCESS_VM_READ = 0x0010
+local TH32CS_SNAPPROCESS = 0x00000002
 local CP_UTF8 = 65001
 local MAX_PATH = 260
 
@@ -3979,102 +3997,57 @@ local function find_game_in_obs()
     return ok and result or nil
 end
 
-local TH32CS_SNAPPROCESS = 0x00000002
-
-local function get_running_game()
+local function get_background_game()
     local ok, result = pcall(function()
-        local MAX_PIDS = 1024
-        local pids = ffi.new("DWORD[?]", MAX_PIDS)
-        local bytes_returned = ffi.new("DWORD[1]", 0)
+        local snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if is_invalid_handle(snapshot) then return nil end
 
-        local enum_ok = psapi.EnumProcesses(pids, MAX_PIDS * ffi.sizeof("DWORD"), bytes_returned)
-        if enum_ok == 0 then
-            dbg("get_running_game: EnumProcesses failed")
+        local pe32 = ffi.new("PROCESSENTRY32")
+        pe32.dwSize = ffi.sizeof("PROCESSENTRY32")
+
+        if kernel32.Process32First(snapshot, pe32) == 0 then
+            kernel32.CloseHandle(snapshot)
             return nil
         end
 
-        local count = math.floor(bytes_returned[0] / ffi.sizeof("DWORD"))
-        dbg("get_running_game: scanning " .. count .. " processes")
-
-        local buffer = ffi.new("char[260]")
-
-        for i = 0, count - 1 do
-            local pid = pids[i]
-            if pid ~= 0 then
-                local name = nil
-
-                -- Try full access + GetModuleBaseNameA first
-                local proc = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION + PROCESS_VM_READ, 0, pid)
-                if not is_invalid_handle(proc) then
-                    local get_ok, len = pcall(function()
-                        return psapi.GetModuleBaseNameA(proc, nil, buffer, 260)
-                    end)
-                    kernel32.CloseHandle(proc)
-                    if get_ok and len and len > 0 then
-                        name = ffi.string(buffer, len)
-                    end
-                end
-
-                -- Fall back to QueryFullProcessImageNameA (works for anti-cheat like BattlEye/Siege)
-                if not name then
-                    local proc2 = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
-                    if not is_invalid_handle(proc2) then
-                        local size = ffi.new("DWORD[1]", 260)
-                        local qok, qres = pcall(function()
-                            local res = kernel32.QueryFullProcessImageNameA(proc2, 0, buffer, size)
-                            if res ~= 0 and size[0] > 0 then
-                                local full = ffi.string(buffer, size[0])
-                                return string.match(full, "([^/\\]+)$") or full
-                            end
-                            return nil
-                        end)
-                        kernel32.CloseHandle(proc2)
-                        if qok and qres then name = qres end
-                    end
-                end
-
-                if name then
-                    name = string.gsub(name, "%.[eE][xX][eE]$", ""):lower()
-                    if not is_ignored(name) and GAME_DATABASE[name] then
-                        dbg("Running game found via process scan: " .. name)
-                        return name
-                    end
-                end
+        repeat
+            local exe_file = ffi.string(pe32.szExeFile)
+            local name = string.gsub(exe_file, "%.[eE][xX][eE]$", ""):lower()
+            
+            if not is_ignored(name) and GAME_DATABASE and GAME_DATABASE[name] then
+                dbg("Background game found via process snapshot: " .. name)
+                kernel32.CloseHandle(snapshot)
+                return name
             end
-        end
+        until kernel32.Process32Next(snapshot, pe32) == 0
 
+        kernel32.CloseHandle(snapshot)
         return nil
     end)
-    if not ok then
-        dbg("get_running_game ERROR: " .. tostring(result))
-        return nil
-    end
-    return result
+    if not ok then dbg("get_background_game ERROR: " .. tostring(result)) end
+    return ok and result or nil
 end
 
 -- Detect active game
 -- Returns: process_or_game_name, window_title, skip_window_fallback
 local function detect_game()
+    local process = get_active_process()
     local title = get_window_title()
     local window_title_for_matching = title
+    local active_ignored = false
 
-    -- 1. Scan all running processes for a known game (works regardless of focus)
-    if CONFIG.scan_all_processes then
-        local running = get_running_game()
-        if running then
-            dbg("Detected from running process scan: " .. running)
-            return running, window_title_for_matching, false
-        end
-    end
-
-    -- 2. Fall back to focused window process (catches unlisted games)
-    local process = get_active_process()
+    -- 1. Check if active process is in ignore list
     if process and is_ignored(process) then
-        dbg("Focused process ignored, using fallback: " .. process)
-        return nil, window_title_for_matching, true
+        dbg("Active process ignored: " .. process)
+        active_ignored = true
     end
-    if process then
-        dbg("Detected from focused process (not in DB): " .. process)
+
+    -- 2. Try active window process
+    if process and not active_ignored then
+        dbg("Detected from active process: " .. process)
+        if title then
+            dbg("Window title available: " .. title)
+        end
         return process, window_title_for_matching, false
     end
 
@@ -4085,7 +4058,21 @@ local function detect_game()
         return obs_game, window_title_for_matching, false
     end
 
-    -- 4. Nothing detected - CAN use window title fallback (anti-cheat case)
+    -- 4. Try background process scan (Fallback)
+    if CONFIG.scan_all_processes then
+        local bg_game = get_background_game()
+        if bg_game then
+            dbg("Detected from running process scan (fallback): " .. bg_game)
+            return bg_game, window_title_for_matching, false
+        end
+    end
+
+    -- 5. Nothing detected. Determine if we should skip window title fallback.
+    if active_ignored then
+        dbg("No game detected, skipping window title fallback (active process was ignored)")
+        return nil, window_title_for_matching, true
+    end
+
     dbg("No game detected, will try window title fallback")
     return nil, window_title_for_matching, false
 end
@@ -5403,7 +5390,7 @@ function script_properties()
     obs.obs_properties_add_bool(folder_group, "organize_screenshots", "📸  Also organize screenshots")
     obs.obs_properties_add_bool(folder_group, "organize_recordings", "🎬  Organize recordings (Start/Stop Recording)")
     obs.obs_properties_add_bool(folder_group, "scan_all_processes", "🔍  Detect game by scanning all running processes")
-    obs.obs_properties_add_text(folder_group, "scan_all_processes_help", "Detects games even when the game window is not focused. Disable to revert to focus-based detection.", obs.OBS_TEXT_INFO)
+    obs.obs_properties_add_text(folder_group, "scan_all_processes_help", "Detects background games when focused on Discord or Desktop (acts as a smart fallback).", obs.OBS_TEXT_INFO)
     obs.obs_properties_add_group(props, "folder_section", "🗂️  ORGANIZATION", obs.OBS_GROUP_NORMAL, folder_group)
 
     -- SPAM PROTECTION GROUP
